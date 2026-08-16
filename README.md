@@ -7,7 +7,7 @@ Private, self-hosted chat UI for KIE's OpenAI-compatible chat models. It does no
 - Password login with a first-run administrator account
 - Streaming KIE chat proxy, keeping the API key off the browser
 - Desktop and mobile UI with a model selector
-- Initial model catalog: Grok, Google Gemini, and OpenAI GPT models offered through compatible KIE endpoints
+- Grok 4.5 and 4.6 through KIE's Responses API, with live text-stream conversion for the web UI
 - Docker Compose deployment with persistent local data
 
 ## Deploy
@@ -25,10 +25,10 @@ The container binds to `127.0.0.1:3000`. Use a TLS reverse proxy such as Caddy b
 
 On first start the app creates `data/models.json`. Users select from that catalog in the chat header; changing models does not require an `.env` edit or container restart.
 
-All catalog entries use this KIE OpenAI-compatible endpoint shape:
+The current Grok catalog uses KIE's Responses API:
 
 ```text
-${KIE_API_BASE}/{model_id}/v1/chat/completions
+${KIE_API_BASE}/grok/v1/responses
 ```
 
-The included catalog is a starting point. Confirm new slugs in KIE's model documentation before adding them. Native Gemini, Responses API, image, and video models use different protocols and need separate adapters instead of being forced through this chat endpoint.
+The included catalog contains only the two model IDs verified from the supplied KIE request examples. New providers and models need their own confirmed endpoint and request/response adapter; do not force them through this protocol.
