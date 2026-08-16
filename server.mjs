@@ -10,8 +10,9 @@ const dataDir = join(root, 'data'), usersFile = join(dataDir, 'users.json'), mod
 const sessions = new Map(), apiBase = (process.env.KIE_API_BASE || 'https://api.kie.ai').replace(/\/$/, '');
 // Verified from the KIE Responses API snippets supplied by the administrator.
 const defaults = [
+  { id: 'grok-4-3', label: 'Grok 4.3', group: 'Grok', protocol: 'responses', endpoint: '/grok/v1/responses' },
+  { id: 'grok-4-5', label: 'Grok 4.5', group: 'Grok', protocol: 'responses', endpoint: '/grok/v1/responses' },
   { id: 'grok-4-6', label: 'Grok 4.6', group: 'Grok', protocol: 'responses', endpoint: '/grok/v1/responses' },
-  { id: 'grok-4-5', label: 'Grok 4.5', group: 'Grok', protocol: 'responses', endpoint: '/grok/v1/responses' }
 ];
 const types = { '.html': 'text/html; charset=utf-8', '.js': 'application/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
 const json = (res, status, data) => { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(data)); };
@@ -22,8 +23,9 @@ async function readJson(file, fallback) { try { return JSON.parse(await readFile
 async function save(file, data) { await mkdir(dataDir, { recursive: true }); await writeFile(file, JSON.stringify(data, null, 2), { mode: 0o600 }); }
 async function users() { return readJson(usersFile, []); }
 async function conversations() { return readJson(conversationsFile, []); }
-async function models() { const list = await readJson(modelsFile, defaults); return Array.isArray(list) && list.length && list.every(x => x.protocol === 'responses' && x.endpoint) ? list : defaults; }
-async function bootstrap() { const list = await users(); if (!list.length && process.env.ADMIN_USERNAME && process.env.ADMIN_PASSWORD) await save(usersFile, [{ username: process.env.ADMIN_USERNAME, password: hash(process.env.ADMIN_PASSWORD), role: 'admin', createdAt: new Date().toISOString() }]); try { const list = JSON.parse(await readFile(modelsFile, 'utf8')); if (!Array.isArray(list) || !list.every(x => x.protocol === 'responses' && x.endpoint)) await save(modelsFile, defaults); } catch { await save(modelsFile, defaults); } }
+function isCurrentCatalog(list) { return Array.isArray(list) && defaults.every(model => list.some(item => item.id === model.id && item.protocol === 'responses' && item.endpoint)); }
+async function models() { const list = await readJson(modelsFile, defaults); return isCurrentCatalog(list) ? list : defaults; }
+async function bootstrap() { const list = await users(); if (!list.length && process.env.ADMIN_USERNAME && process.env.ADMIN_PASSWORD) await save(usersFile, [{ username: process.env.ADMIN_USERNAME, password: hash(process.env.ADMIN_PASSWORD), role: 'admin', createdAt: new Date().toISOString() }]); try { const list = JSON.parse(await readFile(modelsFile, 'utf8')); if (!isCurrentCatalog(list)) await save(modelsFile, defaults); } catch { await save(modelsFile, defaults); } }
 function session(req) { const value = sessions.get(cookies(req).grok_session); return value?.expires > Date.now() ? value : null; }
 function createSession(user) { const token = randomBytes(32).toString('base64url'); sessions.set(token, { username: user.username, role: user.role, expires: Date.now() + 7 * 864e5 }); return token; }
 async function readBody(req) { let text = ''; for await (const piece of req) { text += piece; if (text.length > 2_000_000) throw new Error('Request too large'); } return text ? JSON.parse(text) : {}; }
