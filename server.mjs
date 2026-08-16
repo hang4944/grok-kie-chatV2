@@ -13,6 +13,8 @@ const defaults = [
   { id: 'grok-4-3', label: 'Grok 4.3', group: 'Grok', protocol: 'responses', endpoint: '/grok/v1/responses' },
   { id: 'grok-4-5', label: 'Grok 4.5', group: 'Grok', protocol: 'responses', endpoint: '/grok/v1/responses' },
   { id: 'grok-4-6', label: 'Grok 4.6', group: 'Grok', protocol: 'responses', endpoint: '/grok/v1/responses' },
+  { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash', group: 'Google', protocol: 'chat_completions', endpoint: '/gemini-2.5-flash/v1/chat/completions' },
+  { id: 'gpt-5-5', label: 'GPT-5.5', group: 'OpenAI', protocol: 'responses', endpoint: '/codex/v1/responses' },
 ];
 const types = { '.html': 'text/html; charset=utf-8', '.js': 'application/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
 const json = (res, status, data) => { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(data)); };
@@ -23,7 +25,7 @@ async function readJson(file, fallback) { try { return JSON.parse(await readFile
 async function save(file, data) { await mkdir(dataDir, { recursive: true }); await writeFile(file, JSON.stringify(data, null, 2), { mode: 0o600 }); }
 async function users() { return readJson(usersFile, []); }
 async function conversations() { return readJson(conversationsFile, []); }
-function isCurrentCatalog(list) { return Array.isArray(list) && defaults.every(model => list.some(item => item.id === model.id && item.protocol === 'responses' && item.endpoint)); }
+function isCurrentCatalog(list) { return Array.isArray(list) && defaults.every(model => list.some(item => item.id === model.id && item.protocol === model.protocol && item.endpoint === model.endpoint)); }
 async function models() { const list = await readJson(modelsFile, defaults); return isCurrentCatalog(list) ? list : defaults; }
 async function bootstrap() { const list = await users(); if (!list.length && process.env.ADMIN_USERNAME && process.env.ADMIN_PASSWORD) await save(usersFile, [{ username: process.env.ADMIN_USERNAME, password: hash(process.env.ADMIN_PASSWORD), role: 'admin', createdAt: new Date().toISOString() }]); try { const list = JSON.parse(await readFile(modelsFile, 'utf8')); if (!isCurrentCatalog(list)) await save(modelsFile, defaults); } catch { await save(modelsFile, defaults); } }
 function sign(value) { return createHmac('sha256', sessionSecret).update(value).digest('base64url'); }
@@ -33,7 +35,8 @@ async function readBody(req) { let text = ''; for await (const piece of req) { t
 function validConversation(value) { return value && /^[a-zA-Z0-9_-]{8,80}$/.test(value.id) && typeof value.modelId === 'string' && Array.isArray(value.messages) && value.messages.length <= 200 && value.messages.every(x => x && ['user', 'assistant'].includes(x.role) && typeof x.content === 'string' && x.content.length <= 100000); }
 function sendDelta(res, text) { if (text) res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`); }
 function extractResponseText(result) { let text = typeof result?.output_text === 'string' ? result.output_text : ''; if (!text) for (const output of result?.output || []) for (const part of output?.content || []) if (typeof part?.text === 'string') text = part.text; if (!text) return ''; try { return JSON.parse(text).answer || text; } catch { return text; } }
-function responsesPayload(messages, model) { return { model, stream: false, input: messages.map(message => ({ role: message.role, content: [{ type: message.role === 'assistant' ? 'output_text' : 'input_text', text: String(message.content || '') }] })), text: { format: { type: 'json_schema', name: 'chat_response', strict: true, schema: { type: 'object', properties: { answer: { type: 'string', description: 'The helpful answer to the user.' }, mood: { type: 'string', description: 'The tone of the answer.' } }, required: ['answer', 'mood'], additionalProperties: false } } } }; }
+function responsesPayload(messages, model, structured) { const payload = { model, stream: false, input: messages.map(message => ({ role: message.role, content: [{ type: message.role === 'assistant' ? 'output_text' : 'input_text', text: String(message.content || '') }] })) }; if (structured) payload.text = { format: { type: 'json_schema', name: 'chat_response', strict: true, schema: { type: 'object', properties: { answer: { type: 'string', description: 'The helpful answer to the user.' }, mood: { type: 'string', description: 'The tone of the answer.' } }, required: ['answer', 'mood'], additionalProperties: false } } }; return payload; }
+function chatCompletionsPayload(messages) { return { stream: false, messages: messages.map(message => ({ role: message.role, content: message.role === 'user' ? [{ type: 'text', text: String(message.content || '') }] : String(message.content || '') })) }; }
 async function bridgeResponsesStream(upstream, res, model) { const reader = upstream.body.getReader(), decoder = new TextDecoder(); let buffer = '', emitted = false;
   const consume = line => { if (!line.startsWith('data: ')) return; const raw = line.slice(6); if (raw === '[DONE]') return; try { const event = JSON.parse(raw); const text = typeof event.delta === 'string' ? event.delta : event.type === 'response.output_text.done' ? event.text : ''; if (text) { emitted = true; sendDelta(res, text); } } catch {} };
   try { while (true) { const { done, value } = await reader.read(); if (done) break; buffer += decoder.decode(value, { stream: true }); const lines = buffer.split('\n'); buffer = lines.pop(); lines.forEach(consume); } buffer += decoder.decode(); consume(buffer); } finally { reader.releaseLock(); }
@@ -44,14 +47,15 @@ async function chat(req, res) {
   const payload = await readBody(req), selected = (await models()).find(x => x.id === payload.modelId);
   if (!selected || !Array.isArray(payload.messages) || !payload.messages.length) return json(res, 400, { error: 'Choose a valid model and send messages.' });
   const endpoint = `${apiBase}${selected.endpoint}`;
-  console.log(`[chat] requesting protocol=responses model=${selected.id}`);
-  const upstream = await fetch(endpoint, { method: 'POST', headers: { authorization: `Bearer ${process.env.KIE_API_KEY}`, 'content-type': 'application/json' }, body: JSON.stringify(responsesPayload(payload.messages, selected.id)) });
+  console.log(`[chat] requesting protocol=${selected.protocol} model=${selected.id}`);
+  const requestBody = selected.protocol === 'chat_completions' ? chatCompletionsPayload(payload.messages) : responsesPayload(payload.messages, selected.id, selected.id.startsWith('grok-'));
+  const upstream = await fetch(endpoint, { method: 'POST', headers: { authorization: `Bearer ${process.env.KIE_API_KEY}`, 'content-type': 'application/json' }, body: JSON.stringify(requestBody) });
   const contentType = upstream.headers.get('content-type') || '';
   console.log(`[chat] model=${selected.id} status=${upstream.status} content-type=${contentType}`);
   if (!upstream.ok || !upstream.body) { const detail = await upstream.text(); console.error(`[chat] upstream error model=${selected.id}: ${detail.slice(0, 1000)}`); return json(res, upstream.status, { error: `KIE request failed (${upstream.status}): ${detail}` }); }
   res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no' });
   if (contentType.includes('text/event-stream')) return bridgeResponsesStream(upstream, res, selected.id);
-  const result = await upstream.json().catch(() => null), text = extractResponseText(result);
+  const result = await upstream.json().catch(() => null), text = selected.protocol === 'chat_completions' ? (typeof result?.choices?.[0]?.message?.content === 'string' ? result.choices[0].message.content : result?.choices?.[0]?.message?.content?.find?.(item => item.type === 'text')?.text || '') : extractResponseText(result);
   if (text) sendDelta(res, text); else { console.error(`[chat] unexpected Responses JSON model=${selected.id}: ${JSON.stringify(result).slice(0, 1000)}`); sendDelta(res, 'KIE returned no readable text. Check server logs.'); }
   res.end('data: [DONE]\n\n');
 }
