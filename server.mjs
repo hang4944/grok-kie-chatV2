@@ -1,13 +1,13 @@
 import http from 'node:http';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { randomBytes, scryptSync, timingSafeEqual, createHmac } from 'node:crypto';
 import { join, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const port = Number(process.env.PORT || 3000);
 const root = fileURLToPath(new URL('.', import.meta.url));
 const dataDir = join(root, 'data'), usersFile = join(dataDir, 'users.json'), modelsFile = join(dataDir, 'models.json'), conversationsFile = join(dataDir, 'conversations.json');
-const sessions = new Map(), apiBase = (process.env.KIE_API_BASE || 'https://api.kie.ai').replace(/\/$/, '');
+const sessionSecret = process.env.SESSION_SECRET || 'change-this-session-secret', apiBase = (process.env.KIE_API_BASE || 'https://api.kie.ai').replace(/\/$/, '');
 // Verified from the KIE Responses API snippets supplied by the administrator.
 const defaults = [
   { id: 'grok-4-3', label: 'Grok 4.3', group: 'Grok', protocol: 'responses', endpoint: '/grok/v1/responses' },
@@ -26,8 +26,9 @@ async function conversations() { return readJson(conversationsFile, []); }
 function isCurrentCatalog(list) { return Array.isArray(list) && defaults.every(model => list.some(item => item.id === model.id && item.protocol === 'responses' && item.endpoint)); }
 async function models() { const list = await readJson(modelsFile, defaults); return isCurrentCatalog(list) ? list : defaults; }
 async function bootstrap() { const list = await users(); if (!list.length && process.env.ADMIN_USERNAME && process.env.ADMIN_PASSWORD) await save(usersFile, [{ username: process.env.ADMIN_USERNAME, password: hash(process.env.ADMIN_PASSWORD), role: 'admin', createdAt: new Date().toISOString() }]); try { const list = JSON.parse(await readFile(modelsFile, 'utf8')); if (!isCurrentCatalog(list)) await save(modelsFile, defaults); } catch { await save(modelsFile, defaults); } }
-function session(req) { const value = sessions.get(cookies(req).grok_session); return value?.expires > Date.now() ? value : null; }
-function createSession(user) { const token = randomBytes(32).toString('base64url'); sessions.set(token, { username: user.username, role: user.role, expires: Date.now() + 7 * 864e5 }); return token; }
+function sign(value) { return createHmac('sha256', sessionSecret).update(value).digest('base64url'); }
+function session(req) { const token = cookies(req).grok_session, dot = token?.lastIndexOf('.'); if (!token || dot < 1) return null; const value = token.slice(0, dot), signature = token.slice(dot + 1), expected = sign(value); if (signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null; try { const payload = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')); return payload.expires > Date.now() && typeof payload.username === 'string' ? payload : null; } catch { return null; } }
+function createSession(user) { const value = Buffer.from(JSON.stringify({ username: user.username, role: user.role, expires: Date.now() + 7 * 864e5 })).toString('base64url'); return `${value}.${sign(value)}`; }
 async function readBody(req) { let text = ''; for await (const piece of req) { text += piece; if (text.length > 2_000_000) throw new Error('Request too large'); } return text ? JSON.parse(text) : {}; }
 function validConversation(value) { return value && /^[a-zA-Z0-9_-]{8,80}$/.test(value.id) && typeof value.modelId === 'string' && Array.isArray(value.messages) && value.messages.length <= 200 && value.messages.every(x => x && ['user', 'assistant'].includes(x.role) && typeof x.content === 'string' && x.content.length <= 100000); }
 function sendDelta(res, text) { if (text) res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`); }
@@ -62,8 +63,8 @@ http.createServer(async (req, res) => { try { const url = new URL(req.url, `http
   if (req.method === 'GET' && url.pathname === '/api/conversations') { if (!active) return json(res, 401, { error: 'Sign in first.' }); const list = (await conversations()).filter(x => x.username === active.username).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)); return json(res, 200, { conversations: list }); }
   if (req.method === 'PUT' && url.pathname === '/api/conversations') { if (!active) return json(res, 401, { error: 'Sign in first.' }); const conversation = await readBody(req); if (!validConversation(conversation)) return json(res, 400, { error: 'Invalid conversation.' }); const all = await conversations(), now = new Date().toISOString(), title = conversation.messages.find(x => x.role === 'user')?.content.slice(0, 60) || 'New chat'; const item = { id: conversation.id, username: active.username, title, modelId: conversation.modelId, messages: conversation.messages, createdAt: conversation.createdAt || now, updatedAt: now }; const index = all.findIndex(x => x.id === item.id && x.username === active.username); if (index >= 0) all[index] = item; else all.push(item); await save(conversationsFile, all); return json(res, 200, { conversation: item }); }
   if (req.method === 'DELETE' && url.pathname.startsWith('/api/conversations/')) { if (!active) return json(res, 401, { error: 'Sign in first.' }); const id = url.pathname.slice('/api/conversations/'.length); if (!/^[a-zA-Z0-9_-]{8,80}$/.test(id)) return json(res, 400, { error: 'Invalid conversation ID.' }); const all = await conversations(), next = all.filter(item => item.id !== id || item.username !== active.username); if (next.length === all.length) return json(res, 404, { error: 'Conversation not found.' }); await save(conversationsFile, next); return json(res, 200, { ok: true }); }
-  if (req.method === 'POST' && url.pathname === '/api/login') { const { username, password } = await readBody(req), user = (await users()).find(x => x.username === username); if (!user || !validPassword(String(password || ''), user.password)) return json(res, 401, { error: 'Invalid username or password.' }); const token = createSession(user); res.setHeader('set-cookie', `grok_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800`); return json(res, 200, { user: user.username }); }
-  if (req.method === 'POST' && url.pathname === '/api/logout') { sessions.delete(cookies(req).grok_session); res.setHeader('set-cookie', 'grok_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'); return json(res, 200, { ok: true }); }
+  if (req.method === 'POST' && url.pathname === '/api/login') { const { username, password } = await readBody(req), user = (await users()).find(x => x.username === username); if (!user || !validPassword(String(password || ''), user.password)) return json(res, 401, { error: 'Invalid username or password.' }); const token = createSession(user); res.setHeader('set-cookie', `grok_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800`); return json(res, 200, { user: user.username }); }
+  if (req.method === 'POST' && url.pathname === '/api/logout') { res.setHeader('set-cookie', 'grok_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'); return json(res, 200, { ok: true }); }
   if (req.method === 'POST' && url.pathname === '/api/chat') { if (!active) return json(res, 401, { error: 'Sign in first.' }); return chat(req, res); }
   return staticFile(res, url.pathname);
 } catch (error) { json(res, 500, { error: error instanceof Error ? error.message : 'Server error' }); } }).listen(port, '0.0.0.0', () => console.log(`Grok Desk listening on ${port}`));
