@@ -1,58 +1,15 @@
 import http from 'node:http';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { randomBytes, scryptSync, timingSafeEqual, createHmac } from 'node:crypto';
+import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { join, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-
-const port = Number(process.env.PORT || 3000);
-const root = fileURLToPath(new URL('.', import.meta.url));
-const dataDir = join(root, 'data');
-const usersFile = join(dataDir, 'users.json');
-const sessions = new Map();
-const apiBase = (process.env.KIE_API_BASE || 'https://api.kie.ai').replace(/\/$/, '');
-const model = process.env.KIE_MODEL || 'grok-4-1-fast';
-const staticTypes = { '.html': 'text/html; charset=utf-8', '.js': 'application/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
-
-function parseCookies(req) { return Object.fromEntries((req.headers.cookie || '').split(';').filter(Boolean).map(x => { const i = x.indexOf('='); return [x.slice(0, i).trim(), decodeURIComponent(x.slice(i + 1))]; })); }
-function json(res, code, body) { res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(body)); }
-function hash(password, salt = randomBytes(16).toString('hex')) { return `${salt}:${scryptSync(password, salt, 64).toString('hex')}`; }
-function matches(password, stored) { const [salt, value] = stored.split(':'); const a = Buffer.from(value, 'hex'); const b = scryptSync(password, salt, 64); return a.length === b.length && timingSafeEqual(a, b); }
-async function users() { try { return JSON.parse(await readFile(usersFile, 'utf8')); } catch { return []; } }
-async function saveUsers(value) { await mkdir(dataDir, { recursive: true }); await writeFile(usersFile, JSON.stringify(value, null, 2), { mode: 0o600 }); }
-async function bootstrap() { const list = await users(); if (!list.length && process.env.ADMIN_USERNAME && process.env.ADMIN_PASSWORD) await saveUsers([{ username: process.env.ADMIN_USERNAME, password: hash(process.env.ADMIN_PASSWORD), role: 'admin', createdAt: new Date().toISOString() }]); }
-function auth(req) { const token = parseCookies(req).grok_session; const session = token && sessions.get(token); if (!session || session.expires < Date.now()) return null; return session; }
-function makeSession(username) { const token = randomBytes(32).toString('base64url'); sessions.set(token, { username, expires: Date.now() + 7 * 864e5 }); return token; }
-async function body(req) { let raw = ''; for await (const chunk of req) { raw += chunk; if (raw.length > 2_000_000) throw new Error('Request too large'); } return raw ? JSON.parse(raw) : {}; }
-function safeMessage(error) { return error instanceof Error ? error.message : 'Request failed'; }
-
-async function handleChat(req, res, session) {
-  if (!process.env.KIE_API_KEY) return json(res, 503, { error: 'KIE_API_KEY is not configured on the server.' });
-  const payload = await body(req);
-  if (!Array.isArray(payload.messages) || !payload.messages.length) return json(res, 400, { error: 'messages is required' });
-  const upstream = await fetch(`${apiBase}/${encodeURIComponent(model)}/v1/chat/completions`, {
-    method: 'POST', headers: { authorization: `Bearer ${process.env.KIE_API_KEY}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ model, messages: payload.messages, stream: true, temperature: Number.isFinite(payload.temperature) ? payload.temperature : 0.7 })
-  });
-  if (!upstream.ok || !upstream.body) return json(res, upstream.status, { error: `KIE request failed: ${await upstream.text()}` });
-  res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no' });
-  const reader = upstream.body.getReader();
-  try { while (true) { const { done, value } = await reader.read(); if (done) break; res.write(value); } } finally { res.end(); reader.releaseLock(); }
-}
-
-async function serveStatic(res, pathname) {
-  const file = pathname === '/' ? '/index.html' : pathname;
-  if (!/^\/[a-zA-Z0-9._/-]+$/.test(file) || file.includes('..')) return json(res, 404, { error: 'Not found' });
-  try { const content = await readFile(join(root, 'public', file)); res.writeHead(200, { 'content-type': staticTypes[extname(file)] || 'application/octet-stream' }); res.end(content); } catch { json(res, 404, { error: 'Not found' }); }
-}
-
-await bootstrap();
-http.createServer(async (req, res) => {
-  try {
-    const url = new URL(req.url, `http://${req.headers.host}`); const session = auth(req);
-    if (req.method === 'GET' && url.pathname === '/api/me') return json(res, 200, { user: session?.username || null, model });
-    if (req.method === 'POST' && url.pathname === '/api/login') { const { username, password } = await body(req); const user = (await users()).find(x => x.username === username); if (!user || !matches(String(password || ''), user.password)) return json(res, 401, { error: '账号或密码错误。' }); const token = makeSession(user.username); res.setHeader('set-cookie', `grok_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800`); return json(res, 200, { user: user.username }); }
-    if (req.method === 'POST' && url.pathname === '/api/logout') { const token = parseCookies(req).grok_session; if (token) sessions.delete(token); res.setHeader('set-cookie', 'grok_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'); return json(res, 200, { ok: true }); }
-    if (req.method === 'POST' && url.pathname === '/api/chat') { if (!session) return json(res, 401, { error: '请先登录。' }); return handleChat(req, res, session); }
-    return serveStatic(res, url.pathname);
-  } catch (error) { json(res, 500, { error: safeMessage(error) }); }
-}).listen(port, '0.0.0.0', () => console.log(`Grok KIE Chat listening on ${port}`));
+const port = Number(process.env.PORT || 3000), root = fileURLToPath(new URL('.', import.meta.url)), dataDir = join(root, 'data'), usersFile = join(dataDir, 'users.json'), modelsFile = join(dataDir, 'models.json'), sessions = new Map(), apiBase = (process.env.KIE_API_BASE || 'https://api.kie.ai').replace(/\/$/, '');
+const defaults = [{ id:'grok-4-5',label:'Grok 4.5',group:'Grok'},{id:'grok-4-3',label:'Grok 4.3',group:'Grok'},{id:'gemini-3-5-flash-openai',label:'Gemini 3.5 Flash',group:'Google'},{id:'gemini-3-pro',label:'Gemini 3 Pro',group:'Google'},{id:'gemini-2.5-pro',label:'Gemini 2.5 Pro',group:'Google'},{id:'gpt-5-2',label:'GPT-5.2',group:'OpenAI'}];
+const types={'.html':'text/html; charset=utf-8','.js':'application/javascript; charset=utf-8','.css':'text/css; charset=utf-8'}, json=(res,status,data)=>{res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data));}, cookies=req=>Object.fromEntries((req.headers.cookie||'').split(';').filter(Boolean).map(x=>{const at=x.indexOf('=');return[x.slice(0,at).trim(),decodeURIComponent(x.slice(at+1))]})), hash=(p,s=randomBytes(16).toString('hex'))=>`${s}:${scryptSync(p,s,64).toString('hex')}`;
+const validPassword=(password,value)=>{const[salt,encoded]=value.split(':'),a=Buffer.from(encoded,'hex'),b=scryptSync(password,salt,64);return a.length===b.length&&timingSafeEqual(a,b)};
+async function readJson(file,fallback){try{return JSON.parse(await readFile(file,'utf8'))}catch{return fallback}} async function save(file,data){await mkdir(dataDir,{recursive:true});await writeFile(file,JSON.stringify(data,null,2),{mode:0o600})} async function users(){return readJson(usersFile,[])} async function models(){const list=await readJson(modelsFile,defaults);return Array.isArray(list)&&list.length?list:defaults}
+async function bootstrap(){const list=await users();if(!list.length&&process.env.ADMIN_USERNAME&&process.env.ADMIN_PASSWORD)await save(usersFile,[{username:process.env.ADMIN_USERNAME,password:hash(process.env.ADMIN_PASSWORD),role:'admin',createdAt:new Date().toISOString()}]);try{await readFile(modelsFile)}catch{await save(modelsFile,defaults)}} function session(req){const value=sessions.get(cookies(req).grok_session);return value?.expires>Date.now()?value:null} function createSession(user){const token=randomBytes(32).toString('base64url');sessions.set(token,{username:user.username,role:user.role,expires:Date.now()+7*864e5});return token}
+async function readBody(req){let text='';for await(const piece of req){text+=piece;if(text.length>2_000_000)throw new Error('Request too large')}return text?JSON.parse(text):{}} function validModels(list){return Array.isArray(list)&&list.length&&list.length<=30&&list.every(x=>x&&/^[a-zA-Z0-9._-]{1,80}$/.test(x.id)&&typeof x.label==='string'&&x.label.trim().length<=80&&typeof x.group==='string'&&x.group.trim().length<=40)}
+async function chat(req,res){if(!process.env.KIE_API_KEY)return json(res,503,{error:'KIE_API_KEY is missing on the server.'});const payload=await readBody(req),selected=(await models()).find(x=>x.id===payload.modelId);if(!selected||!Array.isArray(payload.messages)||!payload.messages.length)return json(res,400,{error:'Choose a valid model and send messages.'});const upstream=await fetch(`${apiBase}/${encodeURIComponent(selected.id)}/v1/chat/completions`,{method:'POST',headers:{authorization:`Bearer ${process.env.KIE_API_KEY}`,'content-type':'application/json'},body:JSON.stringify({model:selected.id,messages:payload.messages,stream:true,temperature:0.7})});if(!upstream.ok||!upstream.body)return json(res,upstream.status,{error:`KIE request failed: ${await upstream.text()}`});res.writeHead(200,{'content-type':'text/event-stream; charset=utf-8','cache-control':'no-cache, no-transform',connection:'keep-alive','x-accel-buffering':'no'});const reader=upstream.body.getReader();try{while(true){const{done,value}=await reader.read();if(done)break;res.write(value)}}finally{reader.releaseLock();res.end()}}
+async function staticFile(res,pathname){const file=pathname==='/'?'/index.html':pathname;if(!/^\/[a-zA-Z0-9._/-]+$/.test(file)||file.includes('..'))return json(res,404,{error:'Not found'});try{const content=await readFile(join(root,'public',file));res.writeHead(200,{'content-type':types[extname(file)]||'application/octet-stream'});res.end(content)}catch{json(res,404,{error:'Not found'})}}
+await bootstrap();http.createServer(async(req,res)=>{try{const url=new URL(req.url,`http://${req.headers.host}`),active=session(req);if(req.method==='GET'&&url.pathname==='/api/me')return json(res,200,{user:active?.username||null,isAdmin:active?.role==='admin'});if(req.method==='GET'&&url.pathname==='/api/models')return json(res,200,{models:await models()});if(req.method==='POST'&&url.pathname==='/api/login'){const{username,password}=await readBody(req),user=(await users()).find(x=>x.username===username);if(!user||!validPassword(String(password||''),user.password))return json(res,401,{error:'Invalid username or password.'});const token=createSession(user);res.setHeader('set-cookie',`grok_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800`);return json(res,200,{user:user.username})}if(req.method==='POST'&&url.pathname==='/api/logout'){sessions.delete(cookies(req).grok_session);res.setHeader('set-cookie','grok_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');return json(res,200,{ok:true})}if(req.method==='PUT'&&url.pathname==='/api/admin/models'){if(active?.role!=='admin')return json(res,403,{error:'Admin access required.'});const next=(await readBody(req)).models;if(!validModels(next))return json(res,400,{error:'Invalid model catalog.'});await save(modelsFile,next.map(x=>({id:x.id,label:x.label.trim(),group:x.group.trim()||'Other'})));return json(res,200,{models:await models()})}if(req.method==='POST'&&url.pathname==='/api/chat'){if(!active)return json(res,401,{error:'Sign in first.'});return chat(req,res)}return staticFile(res,url.pathname)}catch(error){json(res,500,{error:error instanceof Error?error.message:'Server error'})}}).listen(port,'0.0.0.0',()=>console.log(`Grok Desk listening on ${port}`));

@@ -1,44 +1,34 @@
 # Grok Desk via KIE
 
-一个可部署到个人服务器的 Grok 风格聊天界面。它不绕过 KIE 的计费、并发或限流规则，实际可用量由你的 KIE 账户决定。
+Private, self-hosted chat UI for KIE's OpenAI-compatible chat models. It does not bypass KIE credit, concurrency, or rate-limit rules.
 
-## 功能
+## Included
 
-- 账号密码登录，首次启动自动创建管理员
-- KIE OpenAI 兼容聊天端点的流式转发
-- 手机与桌面自适应界面
-- 密钥仅留在服务器 `.env`，不进入浏览器和 Git
-- Docker Compose 部署，用户数据持久化在 `./data`
+- Password login with a first-run administrator account
+- Streaming KIE chat proxy, keeping the API key off the browser
+- Desktop and mobile UI with a model selector
+- Initial model catalog: Grok, Google Gemini, and OpenAI GPT models offered through compatible KIE endpoints
+- Docker Compose deployment with persistent local data
 
-## 本地启动
-
-```bash
-cp .env.example .env
-# 编辑 .env，至少填写 KIE_API_KEY、SESSION_SECRET、ADMIN_PASSWORD
-npm start
-```
-
-打开 `http://localhost:3000`。
-
-## 服务器部署
-
-需要 Docker Engine 和 Docker Compose Plugin。复制配置并编辑：
+## Deploy
 
 ```bash
 cp .env.example .env
-nano .env
+# Set KIE_API_KEY, SESSION_SECRET, ADMIN_USERNAME, and ADMIN_PASSWORD.
 docker compose up -d --build
 docker compose logs -f
 ```
 
-默认仅监听服务器本机的 `127.0.0.1:3000`。生产环境请用 HTTPS 反向代理（示例见 `Caddyfile.example`），不要直接把 Node/Docker 端口暴露到公网。
+The container binds to `127.0.0.1:3000`. Use a TLS reverse proxy such as Caddy before exposing it publicly.
 
-## KIE 设置
+## Model catalog
 
-`KIE_MODEL` 必须是 KIE 文档中当前可用的准确模型 slug。程序会请求：
+On first start the app creates `data/models.json`. Users select from that catalog in the chat header; changing models does not require an `.env` edit or container restart.
+
+All catalog entries use this KIE OpenAI-compatible endpoint shape:
 
 ```text
-${KIE_API_BASE}/${KIE_MODEL}/v1/chat/completions
+${KIE_API_BASE}/{model_id}/v1/chat/completions
 ```
 
-若你选择的 Grok 型号或接口变更，只需改 `.env` 的 `KIE_MODEL`，然后执行 `docker compose up -d`。
+The included catalog is a starting point. Confirm new slugs in KIE's model documentation before adding them. Native Gemini, Responses API, image, and video models use different protocols and need separate adapters instead of being forced through this chat endpoint.
