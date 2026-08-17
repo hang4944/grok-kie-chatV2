@@ -56,6 +56,7 @@ async function chat(req, res) {
   res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no' });
   if (contentType.includes('text/event-stream')) return bridgeResponsesStream(upstream, res, selected.id);
   const result = await upstream.json().catch(() => null), text = selected.protocol === 'chat_completions' ? (typeof result?.choices?.[0]?.message?.content === 'string' ? result.choices[0].message.content : result?.choices?.[0]?.message?.content?.find?.(item => item.type === 'text')?.text || '') : extractResponseText(result);
+  if (text?.includes('\uFFFD')) console.warn(`[chat] replacement character received from KIE model=${selected.id}`);
   if (text) sendDelta(res, text); else { console.error(`[chat] unexpected Responses JSON model=${selected.id}: ${JSON.stringify(result).slice(0, 1000)}`); sendDelta(res, 'KIE returned no readable text. Check server logs.'); }
   res.end('data: [DONE]\n\n');
 }

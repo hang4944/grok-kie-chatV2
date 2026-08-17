@@ -1,0 +1,44 @@
+.message-body {
+  min-width: 0;
+}
+
+.copy-message {
+  margin-top: 8px;
+  padding: 4px 7px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 160ms ease-out, background-color 160ms ease-out, color 160ms ease-out;
+}
+
+.message:hover .copy-message,
+.copy-message:focus-visible {
+  opacity: 1;
+}
+
+.copy-message:hover {
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.copy-message:focus-visible {
+  outline: 2px solid #81858a;
+  outline-offset: 2px;
+}
+
+@media (max-width: 640px) {
+  .copy-message {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .copy-message {
+    transition: none;
+  }
+}
